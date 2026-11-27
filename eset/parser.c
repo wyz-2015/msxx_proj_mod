@@ -1,14 +1,66 @@
 #include "common.h"
 #include "script_formatter.h"
+#include <limits.h>
 
 void parser_cond(FILE* restrict esetFile, Script_Formatter* restrict sf)
 {
 	// TODO
-	Script_Formatter_printf(sf, "[...]");
+	// Script_Formatter_printf(sf, "[...]");
+	// fputs("[...]", sf->outFile);
+	fputc('[', sf->outFile);
+
+	int16_t ps = -1;
+	uint8_t stack[UCHAR_MAX], c;
+	int ci; // 用于区分0xff与EOF
+	memset(stack, 0, UCHAR_MAX);
+
+	while (true) {
+		ci = fgetc(esetFile);
+		if (ci == EOF) {
+			error(EIO, EIO, "文件过早结束(0x%lx)", ftell(esetFile));
+		}
+		c = (uint8_t)ci;
+
+		if (c == 0xa0) {
+			if (ps >= 0) {
+				fprintf(sf->outFile, "num(0x%x)", stack[ps]);
+			}
+			break;
+		}
+
+		if (c < 0x99) {
+			ps += 1;
+			stack[ps] = c;
+		} else if (0x99 <= c and c <= 0xa1) {
+			if (ps < 1) {
+				fprintf(sf->outFile, "num(0x%x)", stack[0]);
+			} else {
+				uint8_t c1 = stack[ps], c2 = stack[ps - 1];
+				ps -= 2;
+
+				fprintf(sf->outFile, "(num(0x%x) operator(0x%x) num(0x%x))", c1, c2, c);
+			}
+		}
+	}
+
+	fputc(']', sf->outFile);
+
+	/*
+	if (ftell(esetFile) % 2 == 1) {
+		fseek(esetFile, 1, 1);
+	}
+	*/
+}
+
+void parser_unit(FILE* restrict esetFile, Script_Formatter* restrict sf)
+{
+	// TODO
 }
 
 void parser_core(FILE* restrict esetFile, Script_Formatter* restrict sf)
 {
+	off_t sentenceStartOffset = ftell(esetFile);
+
 	uint8_t opCode, size;
 	fread(&opCode, sizeof(uint8_t), 1, esetFile);
 	fread(&size, sizeof(uint8_t), 1, esetFile);
@@ -55,13 +107,16 @@ void parser_core(FILE* restrict esetFile, Script_Formatter* restrict sf)
 		int16_t gotoOffset;
 		fread(&gotoOffset, sizeof(int16_t), 1, esetFile);
 
-		Script_Formatter_printf(sf, "if_not([...])\n");
+		Script_Formatter_printf(sf, "if_not(");
+		parser_cond(esetFile, sf);
+		fputs(")\n", sf->outFile);
+
 		// Script_Formatter_printf(&sf,"{");
 		Script_Formatter_indent_add(sf, 1);
 		Script_Formatter_printf(sf, "goto(%d)\n", gotoOffset);
 		Script_Formatter_indent_add(sf, -1);
 
-		fseek(esetFile, size - (sizeof(uint8_t) * 2 + sizeof(int16_t)), 1); // 跳过条件解析，暂时
+		// fseek(esetFile, size - (sizeof(uint8_t) * 2 + sizeof(int16_t)), 1); // 跳过条件解析，暂时
 
 		break;
 	}
@@ -88,35 +143,52 @@ void parser_core(FILE* restrict esetFile, Script_Formatter* restrict sf)
 		fread(&y, sizeof(int16_t), 1, esetFile);
 		fread(&unitID, sizeof(uint16_t), 1, esetFile);
 
-		uint16_t paramLen = (size - 10) / sizeof(uint16_t);
-		uint16_t unitParams[paramLen];
-		fread(unitParams, sizeof(uint16_t), paramLen, esetFile);
-
 		Script_Formatter_printf(sf, "spawn(0x%x, 0x%x, 0x%x, 0x%x, Unit_0x%x(", group, flags, x, y, unitID);
-		for (uint16_t i = 0; i < paramLen - 1; i += 1) {
-			fprintf(sf->outFile, "0x%x, ", unitParams[i]);
+
+		uint16_t paramLen = (size - 10) / sizeof(uint16_t);
+		if (paramLen) {
+			uint16_t unitParams[paramLen];
+			fread(unitParams, sizeof(uint16_t), paramLen, esetFile);
+
+			for (uint16_t i = 0; i < paramLen - 1; i += 1) {
+				fprintf(sf->outFile, "0x%x, ", unitParams[i]);
+			}
+			fprintf(sf->outFile, "0x%x))\n", unitParams[paramLen - 1]);
+		} else {
+			fputs("))\n", sf->outFile);
 		}
-		fprintf(sf->outFile, "0x%x))\n", unitParams[paramLen - 1]);
 
 		break;
 	}
 	case 0x09: {
-		uint16_t subLen, group, clearScroll;
-		fread(&subLen, sizeof(uint16_t), 1, esetFile);
+		uint16_t bodyLen, group, clearScroll;
+		fread(&bodyLen, sizeof(uint16_t), 1, esetFile);
 		fread(&group, sizeof(uint16_t), 1, esetFile);
 		fread(&clearScroll, sizeof(uint16_t), 1, esetFile);
 
-		Script_Formatter_printf(sf, "spawn_cond(0x%x, 0x%x, 0x%x, ", subLen, group, clearScroll);
+		Script_Formatter_printf(sf, "spawn_sub(0x%x, 0x%x, 0x%x, ", bodyLen, group, clearScroll);
 
 		parser_cond(esetFile, sf);
 		fputs(", ", sf->outFile);
 		parser_cond(esetFile, sf);
-		fputs(")\n", sf->outFile);
-		fseek(esetFile, size - (sizeof(uint16_t) * 3 + sizeof(uint8_t) * 2), 1); // 暂时跳过解析
+		fputs(") {\n", sf->outFile);
+		// fseek(esetFile, size - (sizeof(uint16_t) * 3 + sizeof(uint8_t) * 2), 1); // 暂时跳过解析
 
 		Script_Formatter_indent_add(sf, 1);
-		parser_core(esetFile, sf);
+
+		uint8_t opCode_peek;
+		while (ftell(esetFile) < sentenceStartOffset + bodyLen) {
+			fread(&opCode_peek, sizeof(uint8_t), 1, esetFile);
+			if (opCode_peek >= 0x80) {
+				fseek(esetFile, sentenceStartOffset + bodyLen, 0);
+				break;
+			}
+			ungetc(opCode_peek, esetFile);
+
+			parser_core(esetFile, sf);
+		}
 		Script_Formatter_indent_add(sf, -1);
+		Script_Formatter_printf(sf, "}\n");
 
 		break;
 	}
@@ -124,18 +196,74 @@ void parser_core(FILE* restrict esetFile, Script_Formatter* restrict sf)
 		Script_Formatter_printf(sf, "if(");
 
 		parser_cond(esetFile, sf);
-		fseek(esetFile, size - (sizeof(uint8_t) * 2), 1); // 暂时跳过解析
+		// fseek(esetFile, size - (sizeof(uint8_t) * 2), 1); // 暂时跳过解析
 		fputs(")\n", sf->outFile);
 
 		Script_Formatter_indent_add(sf, 1);
 		parser_core(esetFile, sf);
-		Script_Formatter_indent_add(sf, 1);
+		Script_Formatter_indent_add(sf, -1);
 
 		break;
 	}
 	case 0x0b: {
-		// TODO
-		// break;
+		uint16_t bodyLen;
+		fread(&bodyLen, sizeof(uint16_t), 1, esetFile);
+
+		Script_Formatter_printf(sf, "{\n");
+		Script_Formatter_indent_add(sf, 1);
+
+		while (ftell(esetFile) < sentenceStartOffset + bodyLen) {
+			parser_core(esetFile, sf);
+		}
+
+		Script_Formatter_indent_add(sf, -1);
+		Script_Formatter_printf(sf, "}\n");
+
+		break;
+	}
+	case 0x0c: {
+		uint16_t bodyLen;
+		fread(&bodyLen, sizeof(uint16_t), 1, esetFile);
+
+		Script_Formatter_printf(sf, "random_choice(\n");
+		Script_Formatter_indent_add(sf, 1);
+
+		while (ftell(esetFile) < sentenceStartOffset + bodyLen) {
+			parser_core(esetFile, sf);
+			Script_Formatter_printf(sf, ",\n");
+		}
+
+		Script_Formatter_indent_add(sf, -1);
+		Script_Formatter_printf(sf, ")\n");
+
+		break;
+	}
+	case 0x0d: {
+		Script_Formatter_printf(sf, "counter_plus1()\n");
+		break;
+	}
+	case 0x0e: {
+		// TODO: unknown
+
+		uint16_t a, b;
+		uint8_t c, d;
+		fread(&a, sizeof(uint16_t), 1, esetFile);
+		fread(&b, sizeof(uint16_t), 1, esetFile);
+		fread(&c, sizeof(uint8_t), 1, esetFile);
+		fread(&d, sizeof(uint8_t), 1, esetFile);
+		Script_Formatter_printf(sf, "scroll(0x%x, 0x%0x, 0x%x, 0x%x)", a, b, c, d);
+
+		break;
+	}
+	case 0x0f: {
+		// TODO: unknown
+		uint16_t a, b;
+		fread(&a, sizeof(uint16_t), 1, esetFile);
+		fread(&b, sizeof(uint16_t), 1, esetFile);
+
+		Script_Formatter_printf(sf, "set_pair(0x%x, 0x%x)", a, b);
+
+		break;
 	}
 	default: {
 		error(EINVAL, EINVAL, "暂不支持的opCode：0x%x。当前位置：0x%lx", opCode, ftell(esetFile));
@@ -152,7 +280,9 @@ void parser_main(FILE* restrict esetFile, FILE* restrict outFile)
 	fread(&varientOffset, sizeof(uint16_t), 1, esetFile);
 	Script_Formatter_printf(&sf, "varientOffset(0x%x)\n", varientOffset);
 
-	while (not feof_(esetFile)) {
+	uint8_t opCode_peek;
+	while ((opCode_peek = fgetc(esetFile)) != 0xff) {
+		ungetc(opCode_peek, esetFile);
 		parser_core(esetFile, &sf);
 	}
 }
